@@ -1,12 +1,9 @@
+"""Entry point: builds the FastAPI application with the delivery layer."""
 import uvicorn
-from fastapi import FastAPI
 
-app = FastAPI()
+from app.routes import create_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()
 
 
 if __name__ == "__main__":
