@@ -205,9 +205,15 @@ class DeliveryEngine:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - never lose a task to an unexpected error
-                await self._finish_retryable(
-                    task, DeliveryResult(outcome="retryable", error=f"engine error: {exc}"),
-                )
+                try:
+                    await self._finish_retryable(
+                        task, DeliveryResult(outcome="retryable", error=f"engine error: {exc}"),
+                    )
+                except Exception:  # noqa: BLE001 - the scheduler must never die
+                    # Last resort: leave the task in_flight; the claim-timeout
+                    # reaper returns it to pending so it still reaches a
+                    # terminal state instead of being lost.
+                    pass
             finally:
                 self._inflight -= 1
 
@@ -375,39 +381,94 @@ class DeliveryEngine:
     ) -> dict:
         """Replay dead letters for a subscription in a time range.
 
-        Replay flips the task back to ``pending`` with a fresh attempt budget
-        (attempt history is preserved) in one atomic transaction; the normal
-        scheduler then claims it, so replay and normal delivery can never
-        double-deliver the same task.
+        Each replayed dead letter produces a NEW delivery task (new delivery
+        id, fresh attempt budget) for the same event, so the receiver treats
+        it as a new event instead of deduplicating it against the original
+        delivery.  The dead-lettered task, its attempt history and its
+        dead-letter record are preserved untouched.
+
+        Selection and marking happen inside one transaction, so concurrent
+        replays over overlapping ranges are serialised: each dead-letter
+        occurrence is replayed at most once, no matter how many replay
+        requests race for it.  If the same event dead-letters again later,
+        that is a new dead-letter row (new delivery id) which can be
+        replayed again.
         """
         now = time.time()
         job_id = uuid.uuid4().hex
-        rows = await self.db.fetchall(
-            "SELECT * FROM dead_letters WHERE subscription_id=? "
-            "AND dead_lettered_at >= ? AND dead_lettered_at <= ? AND replayed_at IS NULL "
-            "ORDER BY dead_lettered_at",
-            (subscription_id, from_ts, to_ts),
-        )
-        async with self.db.transaction():
-            await self.db._execute(
-                "INSERT INTO replay_jobs "
-                "(id, subscription_id, from_ts, to_ts, status, replayed_count, created_by, created_at) "
-                "VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)",
-                (job_id, subscription_id, from_ts, to_ts, len(rows), actor, now),
-            )
-            for row in rows:
+        replayed = 0
+        delivery_ids: list[str] = []
+        try:
+            async with self.db.transaction():
                 await self.db._execute(
-                    "UPDATE delivery_tasks SET status='pending', attempt_count=0, next_attempt_at=?, "
-                    "claimed_at=NULL, dead_letter_reason=NULL, last_error=NULL, updated_at=? "
-                    "WHERE id=? AND status='dead_letter'",
-                    (now, now, row["delivery_id"]),
+                    "INSERT INTO replay_jobs "
+                    "(id, subscription_id, from_ts, to_ts, status, replayed_count, "
+                    "created_by, created_at) "
+                    "VALUES (?, ?, ?, ?, 'running', 0, ?, ?)",
+                    (job_id, subscription_id, from_ts, to_ts, actor, now),
                 )
+                rows = await self.db._fetchall(
+                    "SELECT * FROM dead_letters WHERE subscription_id=? "
+                    "AND dead_lettered_at >= ? AND dead_lettered_at <= ? "
+                    "AND replayed_at IS NULL ORDER BY dead_lettered_at",
+                    (subscription_id, from_ts, to_ts),
+                )
+                for row in rows:
+                    task = await self.db._fetchone(
+                        "SELECT * FROM delivery_tasks WHERE id=?", (row["delivery_id"],)
+                    )
+                    if task is None or task["status"] != "dead_letter":
+                        continue  # not currently dead-lettered; nothing to replay
+                    # Mark first: if a racing replay already marked this dead
+                    # letter, skip it so it is never re-delivered twice.
+                    cur = await self.db._execute(
+                        "UPDATE dead_letters SET replayed_at=?, "
+                        "replay_count=replay_count+1, replay_job_id=? "
+                        "WHERE id=? AND replayed_at IS NULL",
+                        (now, job_id, row["id"]),
+                    )
+                    if not cur:
+                        continue
+                    new_id = uuid.uuid4().hex
+                    await self.db._execute(
+                        "INSERT INTO delivery_tasks "
+                        "(id, event_id, subscription_id, ordering_key, status, "
+                        "attempt_count, max_attempts, next_attempt_at, "
+                        "replay_of, replay_job_id, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)",
+                        (
+                            new_id, row["event_id"], subscription_id,
+                            task["ordering_key"], self.config.max_attempts, now,
+                            row["delivery_id"], job_id, now, now,
+                        ),
+                    )
+                    replayed += 1
+                    delivery_ids.append(new_id)
                 await self.db._execute(
-                    "UPDATE dead_letters SET replayed_at=?, replay_count=replay_count+1 "
-                    "WHERE delivery_id=?",
-                    (now, row["delivery_id"]),
+                    "UPDATE replay_jobs SET status='completed', replayed_count=?, "
+                    "finished_at=? WHERE id=?",
+                    (replayed, time.time(), job_id),
                 )
-        return {"job_id": job_id, "replayed": len(rows)}
+        except Exception as exc:
+            # A failed replay must also be traceable: record the job as
+            # failed (best effort) before propagating the error.
+            try:
+                await self.db.execute(
+                    "INSERT INTO replay_jobs "
+                    "(id, subscription_id, from_ts, to_ts, status, replayed_count, "
+                    "created_by, created_at, finished_at, detail) "
+                    "VALUES (?, ?, ?, ?, 'failed', 0, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET status='failed', "
+                    "finished_at=excluded.finished_at, detail=excluded.detail",
+                    (
+                        job_id, subscription_id, from_ts, to_ts, actor, now,
+                        time.time(), f"{type(exc).__name__}: {exc}",
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - never mask the original error
+                pass
+            raise
+        return {"job_id": job_id, "replayed": replayed, "delivery_ids": delivery_ids}
 
     async def metrics(self) -> dict:
         now = time.time()

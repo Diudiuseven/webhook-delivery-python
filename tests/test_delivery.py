@@ -565,21 +565,39 @@ def test_dead_letter_replay_preserves_history(tmp_path):
             headers={"X-API-Key": cfg.admin_api_key},
         )
         assert r.status_code == 200 and r.json()["replayed"] == 1
+        replay_delivery_ids = r.json()["delivery_ids"]
+        assert len(replay_delivery_ids) == 1
 
         for _ in range(200):
             ev = client.get(f"/events/{event_id}").json()
-            if ev["deliveries"][0]["status"] == "succeeded":
+            if any(d["status"] == "succeeded" for d in ev["deliveries"]):
                 break
             import time as _t; _t.sleep(0.02)
         else:
             raise AssertionError("replayed event not delivered")
 
-        task = ev["deliveries"][0]
-        detail = client.get(f"/deliveries/{task['id']}").json()
-        assert detail["status"] == "succeeded"
-        # Attempt history is preserved across the replay.
-        assert len(detail["attempts"]) >= 2
-        assert any(a["result"] == "permanent" for a in detail["attempts"])
+        # The replay produced a NEW delivery task; the dead-lettered one is
+        # preserved as history.
+        assert len(ev["deliveries"]) == 2
+        old, new = ev["deliveries"]
+        assert old["status"] == "dead_letter"
+        assert new["id"] == replay_delivery_ids[0]
+        assert new["status"] == "succeeded"
+        assert new["replay_of"] == old["id"]
+        assert new["attempt_count"] == 1  # fresh attempt budget, re-counted
+
+        # The receiver processed the replay as a NEW event, not a duplicate.
+        assert len(rx.seen) == 2
+        replayed_receipts = [e for e in rx.received if e.delivery_id == new["id"]]
+        assert len(replayed_receipts) == 1 and replayed_receipts[0].duplicate is False
+
+        # Attempt history of the original delivery is preserved untouched.
+        old_detail = client.get(f"/deliveries/{old['id']}").json()
+        assert old_detail["status"] == "dead_letter"
+        assert [a["result"] for a in old_detail["attempts"]] == ["permanent"]
+        # The replayed delivery carries only its own attempts.
+        new_detail = client.get(f"/deliveries/{new['id']}").json()
+        assert [a["result"] for a in new_detail["attempts"]] == ["success"]
 
         dl2 = client.get(
             "/admin/dead-letters", headers={"X-API-Key": cfg.viewer_api_key}

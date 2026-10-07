@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at REAL NOT NULL
 );
 
+-- NOTE: a replay creates a NEW delivery task row for the same
+-- (event_id, subscription_id); the dead-lettered row is preserved as
+-- history.  There is therefore intentionally no UNIQUE(event_id,
+-- subscription_id) constraint.  ``replay_of`` / ``replay_job_id`` link a
+-- replayed delivery back to the dead-lettered delivery it replaces.
 CREATE TABLE IF NOT EXISTS delivery_tasks (
     id TEXT PRIMARY KEY,
     event_id TEXT NOT NULL REFERENCES events(id),
@@ -43,9 +48,10 @@ CREATE TABLE IF NOT EXISTS delivery_tasks (
     claimed_at REAL,
     last_error TEXT,
     dead_letter_reason TEXT,
+    replay_of TEXT,
+    replay_job_id TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    UNIQUE(event_id, subscription_id)
+    updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON delivery_tasks(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_sub ON delivery_tasks(subscription_id, status);
@@ -74,7 +80,8 @@ CREATE TABLE IF NOT EXISTS dead_letters (
     attempts_json TEXT NOT NULL,
     dead_lettered_at REAL NOT NULL,
     replayed_at REAL,
-    replay_count INTEGER NOT NULL DEFAULT 0
+    replay_count INTEGER NOT NULL DEFAULT 0,
+    replay_job_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dead_letters_sub ON dead_letters(subscription_id, dead_lettered_at);
 
@@ -94,7 +101,9 @@ CREATE TABLE IF NOT EXISTS replay_jobs (
     status TEXT NOT NULL,
     replayed_count INTEGER NOT NULL DEFAULT 0,
     created_by TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    finished_at REAL,
+    detail TEXT
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -114,6 +123,80 @@ CREATE TABLE IF NOT EXISTS principals (
     role TEXT NOT NULL
 );
 """
+
+# Columns of the current delivery_tasks schema, in order.  Used by the
+# legacy-table rebuild migration to copy rows across.
+_DELIVERY_TASKS_COLUMNS = (
+    "id, event_id, subscription_id, ordering_key, status, attempt_count, "
+    "max_attempts, next_attempt_at, claimed_at, last_error, dead_letter_reason, "
+    "replay_of, replay_job_id, created_at, updated_at"
+)
+
+# Columns added after the initial schema; missing ones are backfilled with
+# ALTER TABLE so existing databases keep working.
+_ADDED_COLUMNS = {
+    "delivery_tasks": {"replay_of": "TEXT", "replay_job_id": "TEXT"},
+    "dead_letters": {"replay_job_id": "TEXT"},
+    "replay_jobs": {"finished_at": "REAL", "detail": "TEXT"},
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring databases created by older schema versions up to date."""
+    # Rebuild delivery_tasks if it still carries the legacy
+    # UNIQUE(event_id, subscription_id) constraint: a replay must be able to
+    # create a fresh delivery task for the same (event, subscription).
+    indexes = conn.execute("PRAGMA index_list(delivery_tasks)").fetchall()
+    legacy_unique = any(idx[2] == 1 and idx[3] == "u" for idx in indexes)
+    if legacy_unique:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                "CREATE TABLE delivery_tasks_mig ("
+                "id TEXT PRIMARY KEY, "
+                "event_id TEXT NOT NULL REFERENCES events(id), "
+                "subscription_id TEXT NOT NULL REFERENCES subscriptions(id), "
+                "ordering_key TEXT NOT NULL, status TEXT NOT NULL, "
+                "attempt_count INTEGER NOT NULL DEFAULT 0, "
+                "max_attempts INTEGER NOT NULL, next_attempt_at REAL NOT NULL, "
+                "claimed_at REAL, last_error TEXT, dead_letter_reason TEXT, "
+                "replay_of TEXT, replay_job_id TEXT, "
+                "created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+            )
+            shared = ", ".join(
+                c for c in _DELIVERY_TASKS_COLUMNS.split(", ")
+                if c not in ("replay_of", "replay_job_id")
+            )
+            conn.execute(
+                f"INSERT INTO delivery_tasks_mig ({shared}) "
+                f"SELECT {shared} FROM delivery_tasks"
+            )
+            conn.execute("DROP TABLE delivery_tasks")
+            conn.execute("ALTER TABLE delivery_tasks_mig RENAME TO delivery_tasks")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_due "
+                "ON delivery_tasks(status, next_attempt_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_sub "
+                "ON delivery_tasks(subscription_id, status)"
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
+    _ensure_columns(conn)
 
 
 class Transaction:
@@ -156,6 +239,7 @@ class Database:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(SCHEMA)
+            _migrate(conn)
             return conn
 
         self._conn = await asyncio.to_thread(_open)
