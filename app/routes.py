@@ -88,8 +88,8 @@ def create_router(engine: DeliveryEngine, db: Database, key_store: KeyStore, con
         if event is None:
             raise HTTPException(status_code=404, detail="event not found")
         tasks = await db.fetchall(
-            "SELECT id, subscription_id, status, attempt_count, max_attempts, next_attempt_at, "
-            "dead_letter_reason, last_error, created_at, updated_at "
+            "SELECT id, subscription_id, status, attempt_count, max_attempts, replay_seq, "
+            "next_attempt_at, dead_letter_reason, last_error, created_at, updated_at "
             "FROM delivery_tasks WHERE event_id=? ORDER BY created_at",
             (event_id,),
         )
@@ -146,8 +146,9 @@ def create_router(engine: DeliveryEngine, db: Database, key_store: KeyStore, con
         if task is None:
             raise HTTPException(status_code=404, detail="delivery not found")
         attempts = await db.fetchall(
-            "SELECT attempt_number, result, status_code, error, latency_ms, started_at, finished_at "
-            "FROM delivery_attempts WHERE delivery_id=? ORDER BY attempt_number",
+            "SELECT replay_seq, attempt_number, result, status_code, error, latency_ms, "
+            "started_at, finished_at "
+            "FROM delivery_attempts WHERE delivery_id=? ORDER BY id",
             (delivery_id,),
         )
         d = dict(task)
@@ -197,6 +198,24 @@ def create_router(engine: DeliveryEngine, db: Database, key_store: KeyStore, con
         await _audit(db, principal["name"], principal["role"], "replay",
                      f"subscription:{sub_id}", "allowed", json.dumps(result))
         return result
+
+    # ---- replay jobs (viewer + admin) --------------------------------------
+    @router.get("/admin/replay-jobs")
+    async def list_replay_jobs(request: Request, subscription_id: Optional[str] = None,
+                               limit: int = 100):
+        principal = await _auth(request, {"viewer", "admin"}, "replay_jobs:read")
+        sql = ("SELECT id, subscription_id, from_ts, to_ts, status, replayed_count, "
+               "created_by, created_at FROM replay_jobs")
+        params: list = []
+        if subscription_id:
+            sql += " WHERE subscription_id=?"
+            params.append(subscription_id)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        rows = await db.fetchall(sql, params)
+        await _audit(db, principal["name"], principal["role"], "replay_jobs:read",
+                     request.url.path, "allowed", f"{len(rows)} rows")
+        return [dict(r) for r in rows]
 
     # ---- key rotation (admin only) ---------------------------------------
     @router.post("/admin/keys/rotate")

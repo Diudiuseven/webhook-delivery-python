@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS delivery_tasks (
     status TEXT NOT NULL,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL,
+    replay_seq INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL,
     claimed_at REAL,
     last_error TEXT,
@@ -53,6 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_sub ON delivery_tasks(subscription_id, stat
 CREATE TABLE IF NOT EXISTS delivery_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     delivery_id TEXT NOT NULL REFERENCES delivery_tasks(id),
+    replay_seq INTEGER NOT NULL DEFAULT 0,
     attempt_number INTEGER NOT NULL,
     result TEXT NOT NULL,
     status_code INTEGER,
@@ -74,7 +76,8 @@ CREATE TABLE IF NOT EXISTS dead_letters (
     attempts_json TEXT NOT NULL,
     dead_lettered_at REAL NOT NULL,
     replayed_at REAL,
-    replay_count INTEGER NOT NULL DEFAULT 0
+    replay_count INTEGER NOT NULL DEFAULT 0,
+    last_replay_job_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dead_letters_sub ON dead_letters(subscription_id, dead_lettered_at);
 
@@ -114,6 +117,21 @@ CREATE TABLE IF NOT EXISTS principals (
     role TEXT NOT NULL
 );
 """
+
+# Columns added after the initial schema; applied idempotently to databases
+# created by older versions so upgrades do not require a rebuild.
+_MIGRATIONS = (
+    ("delivery_tasks", "replay_seq", "replay_seq INTEGER NOT NULL DEFAULT 0"),
+    ("delivery_attempts", "replay_seq", "replay_seq INTEGER NOT NULL DEFAULT 0"),
+    ("dead_letters", "last_replay_job_id", "last_replay_job_id TEXT"),
+)
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    for table, column, ddl in _MIGRATIONS:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 class Transaction:
@@ -156,6 +174,7 @@ class Database:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(SCHEMA)
+            _apply_migrations(conn)
             return conn
 
         self._conn = await asyncio.to_thread(_open)

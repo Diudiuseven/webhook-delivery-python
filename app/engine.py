@@ -16,6 +16,12 @@ Guarantees implemented here:
   cap prevent a single subscription from monopolising delivery capacity.
 * Claim timeout: tasks stuck in ``in_flight`` past the claim timeout are
   reaped and re-delivered (redelivery is safe because receivers deduplicate).
+* Replay: replaying a dead letter starts a new *delivery round*
+  (``replay_seq``).  The wire delivery id is derived from the round, so a
+  replayed event is processed by receivers as a new event, while retries
+  inside a round keep the same id and are still deduplicated.  Re-dead-
+  lettering upserts the dead-letter row, so an event can be replayed any
+  number of times without errors or stuck states.
 """
 from __future__ import annotations
 
@@ -97,6 +103,7 @@ class DeliveryEngine:
             "dead_lettered": 0,
             "reclaimed": 0,
             "interrupted": 0,
+            "replayed": 0,
         }
 
     # ------------------------------------------------------------------
@@ -146,6 +153,7 @@ class DeliveryEngine:
         for row in rows:
             await self._record_attempt(
                 row["id"],
+                row["replay_seq"],
                 row["attempt_count"],
                 DeliveryResult(outcome="interrupted", error="claim timed out / process restarted"),
             )
@@ -211,8 +219,24 @@ class DeliveryEngine:
             finally:
                 self._inflight -= 1
 
+    @staticmethod
+    def _wire_delivery_id(task) -> str:
+        """Delivery id sent to the receiver for the task's current round.
+
+        Round 0 (original delivery) uses the bare task id.  Each replay starts
+        a new round (``replay_seq`` is incremented) and derives a fresh id, so
+        the receiver treats a replayed delivery as a *new* event instead of
+        deduplicating it against the dead-lettered round.  Retries and
+        crash-recovery redeliveries stay within the same round and keep the
+        same id, so receivers still deduplicate them.
+        """
+        replay_seq = task["replay_seq"]
+        if replay_seq == 0:
+            return task["id"]
+        return f"{task['id']}:r{replay_seq}"
+
     async def _attempt(self, task: dict) -> None:
-        delivery_id = task["id"]
+        wire_delivery_id = self._wire_delivery_id(task)
         sub = await self.db.fetchone(
             "SELECT * FROM subscriptions WHERE id=?", (task["subscription_id"],)
         )
@@ -228,7 +252,7 @@ class DeliveryEngine:
         timestamp = int(time.time())
         body = event["payload"].encode("utf-8")
         headers = sign_headers(key.secret, key.key_id, timestamp, body)
-        headers[DELIVERY_ID_HEADER] = delivery_id
+        headers[DELIVERY_ID_HEADER] = wire_delivery_id
         headers[EVENT_ID_HEADER] = event["id"]
         headers[EVENT_TYPE_HEADER] = event["event_type"]
 
@@ -239,7 +263,7 @@ class DeliveryEngine:
 
         # attempt_count was incremented atomically at claim time.
         attempt_number = task["attempt_count"] + 1
-        await self._record_attempt(delivery_id, attempt_number, result)
+        await self._record_attempt(task["id"], task["replay_seq"], attempt_number, result)
         if result.outcome == "success":
             await self._finish_success(task, result)
         elif result.outcome == "permanent":
@@ -250,15 +274,18 @@ class DeliveryEngine:
     # ------------------------------------------------------------------
     # Attempt outcome handling
     # ------------------------------------------------------------------
-    async def _record_attempt(self, delivery_id: str, attempt_number: int, result: DeliveryResult) -> None:
+    async def _record_attempt(
+        self, delivery_id: str, replay_seq: int, attempt_number: int, result: DeliveryResult
+    ) -> None:
         now = time.time()
         await self.db.execute(
             "INSERT INTO delivery_attempts "
-            "(delivery_id, attempt_number, result, status_code, error, latency_ms, started_at, finished_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(delivery_id, replay_seq, attempt_number, result, status_code, error, "
+            "latency_ms, started_at, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                delivery_id, attempt_number, result.outcome, result.status_code, result.error,
-                result.latency_ms, now - max(result.latency_ms, 0) / 1000.0, now,
+                delivery_id, replay_seq, attempt_number, result.outcome, result.status_code,
+                result.error, result.latency_ms, now - max(result.latency_ms, 0) / 1000.0, now,
             ),
         )
 
@@ -301,16 +328,20 @@ class DeliveryEngine:
 
     async def _dead_letter(self, task: dict, reason: str, result: DeliveryResult) -> None:
         now = time.time()
-        attempts = await self.db.fetchall(
-            "SELECT attempt_number, result, status_code, error, latency_ms, started_at, finished_at "
-            "FROM delivery_attempts WHERE delivery_id=? ORDER BY attempt_number",
-            (task["id"],),
-        )
-        attempts_json = json.dumps([dict(a) for a in attempts])
         fresh = await self.db.fetchone(
-            "SELECT attempt_count FROM delivery_tasks WHERE id=?", (task["id"],)
+            "SELECT attempt_count, replay_seq FROM delivery_tasks WHERE id=?", (task["id"],)
         )
         attempt_count = fresh["attempt_count"] if fresh else task["attempt_count"]
+        replay_seq = fresh["replay_seq"] if fresh else task["replay_seq"]
+        # Snapshot the attempts of the round that just failed; the full
+        # cross-round history stays queryable in delivery_attempts.
+        attempts = await self.db.fetchall(
+            "SELECT replay_seq, attempt_number, result, status_code, error, latency_ms, "
+            "started_at, finished_at FROM delivery_attempts "
+            "WHERE delivery_id=? AND replay_seq=? ORDER BY attempt_number",
+            (task["id"], replay_seq),
+        )
+        attempts_json = json.dumps([dict(a) for a in attempts])
         async with self.db.transaction():
             cur = await self.db._execute(
                 "UPDATE delivery_tasks SET status='dead_letter', dead_letter_reason=?, claimed_at=NULL, "
@@ -318,11 +349,19 @@ class DeliveryEngine:
                 (reason, now, task["id"]),
             )
             if cur:
+                # Upsert: a task may be replayed and dead-letter again any
+                # number of times.  The row tracks the *latest* dead-lettering
+                # (and becomes replayable again via replayed_at=NULL) while
+                # replay_count keeps accumulating across rounds.
                 await self.db._execute(
                     "INSERT INTO dead_letters "
                     "(id, delivery_id, event_id, subscription_id, reason, last_error, attempt_count, "
-                    "attempts_json, dead_lettered_at, replay_count) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    "attempts_json, dead_lettered_at, replayed_at, replay_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0) "
+                    "ON CONFLICT(delivery_id) DO UPDATE SET "
+                    "reason=excluded.reason, last_error=excluded.last_error, "
+                    "attempt_count=excluded.attempt_count, attempts_json=excluded.attempts_json, "
+                    "dead_lettered_at=excluded.dead_lettered_at, replayed_at=NULL",
                     (
                         uuid.uuid4().hex, task["id"], task["event_id"], task["subscription_id"],
                         reason, result.error, attempt_count, attempts_json, now,
@@ -375,39 +414,57 @@ class DeliveryEngine:
     ) -> dict:
         """Replay dead letters for a subscription in a time range.
 
-        Replay flips the task back to ``pending`` with a fresh attempt budget
-        (attempt history is preserved) in one atomic transaction; the normal
-        scheduler then claims it, so replay and normal delivery can never
-        double-deliver the same task.
+        Each replayed task starts a **new delivery round**: ``replay_seq`` is
+        incremented, the attempt budget is reset (history is preserved in
+        ``delivery_attempts``), and the task goes back to ``pending`` so the
+        normal scheduler claims it under the usual concurrency limits.  The
+        new round derives a fresh wire delivery id, so receivers process the
+        replay as a new event instead of deduplicating it.
+
+        The selection and all updates happen in a single ``BEGIN IMMEDIATE``
+        transaction and every row is transitioned with a conditional UPDATE,
+        so concurrent replay jobs (overlapping ranges or the same event) are
+        deterministic: each dead-letter entry is replayed by exactly one job,
+        and a job's ``replayed`` count reflects only the rows it actually
+        transitioned.  A task that dead-letters again becomes replayable again
+        (its ``dead_letters`` row is reset to ``replayed_at=NULL``).
         """
         now = time.time()
         job_id = uuid.uuid4().hex
-        rows = await self.db.fetchall(
-            "SELECT * FROM dead_letters WHERE subscription_id=? "
-            "AND dead_lettered_at >= ? AND dead_lettered_at <= ? AND replayed_at IS NULL "
-            "ORDER BY dead_lettered_at",
-            (subscription_id, from_ts, to_ts),
-        )
+        replayed_ids: list[str] = []
         async with self.db.transaction():
+            rows = await self.db._fetchall(
+                "SELECT delivery_id FROM dead_letters WHERE subscription_id=? "
+                "AND dead_lettered_at >= ? AND dead_lettered_at <= ? AND replayed_at IS NULL "
+                "ORDER BY dead_lettered_at",
+                (subscription_id, from_ts, to_ts),
+            )
+            for row in rows:
+                cur = await self.db._execute(
+                    "UPDATE delivery_tasks SET status='pending', attempt_count=0, "
+                    "replay_seq=replay_seq+1, next_attempt_at=?, claimed_at=NULL, "
+                    "dead_letter_reason=NULL, last_error=NULL, updated_at=? "
+                    "WHERE id=? AND status='dead_letter'",
+                    (now, now, row["delivery_id"]),
+                )
+                if not cur:
+                    # Task is not in dead_letter state (e.g. a concurrent job
+                    # already replayed it): skip without counting it.
+                    continue
+                await self.db._execute(
+                    "UPDATE dead_letters SET replayed_at=?, replay_count=replay_count+1, "
+                    "last_replay_job_id=? WHERE delivery_id=? AND replayed_at IS NULL",
+                    (now, job_id, row["delivery_id"]),
+                )
+                replayed_ids.append(row["delivery_id"])
             await self.db._execute(
                 "INSERT INTO replay_jobs "
                 "(id, subscription_id, from_ts, to_ts, status, replayed_count, created_by, created_at) "
                 "VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)",
-                (job_id, subscription_id, from_ts, to_ts, len(rows), actor, now),
+                (job_id, subscription_id, from_ts, to_ts, len(replayed_ids), actor, now),
             )
-            for row in rows:
-                await self.db._execute(
-                    "UPDATE delivery_tasks SET status='pending', attempt_count=0, next_attempt_at=?, "
-                    "claimed_at=NULL, dead_letter_reason=NULL, last_error=NULL, updated_at=? "
-                    "WHERE id=? AND status='dead_letter'",
-                    (now, now, row["delivery_id"]),
-                )
-                await self.db._execute(
-                    "UPDATE dead_letters SET replayed_at=?, replay_count=replay_count+1 "
-                    "WHERE delivery_id=?",
-                    (now, row["delivery_id"]),
-                )
-        return {"job_id": job_id, "replayed": len(rows)}
+        self.counters["replayed"] += len(replayed_ids)
+        return {"job_id": job_id, "replayed": len(replayed_ids)}
 
     async def metrics(self) -> dict:
         now = time.time()
